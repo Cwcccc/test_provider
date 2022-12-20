@@ -6,10 +6,12 @@ import (
 	"fmt"
 	"github.com/chnsz/golangsdk/openstack/servicestage/v2/instances"
 	"github.com/chnsz/golangsdk/openstack/servicestage/v3/components"
+	"github.com/hashicorp/go-multierror"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/diag"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/resource"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/validation"
+	"github.com/huaweicloud/terraform-provider-huaweicloud/huaweicloud/common"
 	"github.com/huaweicloud/terraform-provider-huaweicloud/huaweicloud/config"
 	"log"
 	"regexp"
@@ -188,9 +190,9 @@ func probeDetailSchemaResource1() *schema.Resource {
 func ResourceComp() *schema.Resource {
 	return &schema.Resource{
 		CreateContext: resourceCompCreate,
-		ReadContext:   resourceComponentRead,
-		UpdateContext: resourceComponentUpdate,
-		DeleteContext: resourceComponentDelete,
+		ReadContext:   resourceCompRead,
+		UpdateContext: resourceCompUpdate,
+		DeleteContext: resourceCompDelete,
 		//
 		//Importer: &schema.ResourceImporter{
 		//	StateContext: resourceComponentImportState,
@@ -1083,8 +1085,116 @@ func resourceCompCreate(ctx context.Context, d *schema.ResourceData, meta interf
 			d.Id(), err)
 	}
 
+	return resourceCompRead(ctx, d, meta)
+}
+
+func resourceCompRead(ctx context.Context, d *schema.ResourceData, meta interface{}) diag.Diagnostics {
+	config := meta.(*config.Config)
+	region := config.GetRegion(d)
+	client, err := config.ServiceStageV3Client(region)
+	if err != nil {
+		return diag.Errorf("error creating ServiceStage v2 client: %s", err)
+	}
+
+	appId := d.Get("application_id").(string)
+	componentId := d.Get("component_id").(string)
+	resp, err := instances.Get(client, appId, componentId, d.Id())
+	if err != nil {
+		return common.CheckDeletedDiag(d, err, "error retrieving ServiceStage component instance")
+	}
+
+	mErr := multierror.Append(nil,
+		d.Set("region", region),
+		d.Set("environment_id", resp.EnvironmentId),
+		d.Set("name", resp.Name),
+		d.Set("version", resp.Version),
+		d.Set("replica", resp.StatusDetail.Replica),
+		d.Set("flavor_id", resp.FlavorId),
+		d.Set("description", resp.Description),
+		d.Set("artifact", flattenArtifact(resp.Artifacts)),
+		d.Set("refer_resource", flattenReferResources(resp.ReferResources)),
+		d.Set("configuration", flattenConfiguration(resp.Configuration)),
+		d.Set("external_access", flattenExternalAccesses(resp.ExternalAccesses)),
+		// Attributes
+		d.Set("status", resp.StatusDetail.Status),
+	)
+
+	return diag.FromErr(mErr.ErrorOrNil())
+}
+
+
+func resourceCompUpdate(ctx context.Context, d *schema.ResourceData, meta interface{}) diag.Diagnostics {
+	config := meta.(*config.Config)
+	region := config.GetRegion(d)
+	client, err := config.ServiceStageV2Client(region)
+	if err != nil {
+		return diag.Errorf("error creating ServiceStage v2 client: %s", err)
+	}
+
+	appId := d.Get("application_id").(string)
+	componentId := d.Get("component_id").(string)
+	opt, err := buildInstanceUpdateOpts(d)
+	if err != nil {
+		return diag.Errorf("error building the UpdateOpts of the component instance: %s", err)
+	}
+	log.Printf("[DEBUG] The instance update option of ServiceStage component is: %v", opt)
+
+	resp, err := instances.Update(client, appId, componentId, d.Id(), opt)
+	if err != nil {
+		return diag.Errorf("error updating component instance: %s", err)
+	}
+
+	log.Printf("[DEBUG] Waiting for the component instance to become running, the instance ID is %s.", d.Id())
+	stateConf := &resource.StateChangeConf{
+		Pending:      []string{"RUNNING"},
+		Target:       []string{"SUCCEEDED"},
+		Refresh:      componentInstanceRefreshFunc(client, resp.JobId),
+		Timeout:      d.Timeout(schema.TimeoutUpdate),
+		Delay:        5 * time.Second,
+		PollInterval: 5 * time.Second,
+	}
+	_, err = stateConf.WaitForStateContext(ctx)
+	if err != nil {
+		return diag.Errorf("error waiting for the updation of component instance (%s) to complete: %s",
+			d.Id(), err)
+	}
+
 	return resourceComponentInstanceRead(ctx, d, meta)
 }
+
+func resourceCompDelete(ctx context.Context, d *schema.ResourceData, meta interface{}) diag.Diagnostics {
+	config := meta.(*config.Config)
+	region := config.GetRegion(d)
+	client, err := config.ServiceStageV2Client(region)
+	if err != nil {
+		return diag.Errorf("error creating ServiceStage v2 client: %s", err)
+	}
+
+	appId := d.Get("application_id").(string)
+	componentId := d.Get("component_id").(string)
+	resp, err := instances.Delete(client, appId, componentId, d.Id())
+	if err != nil {
+		return diag.Errorf("error deleting ServiceStage component instance (%s): %s", d.Id(), err)
+	}
+
+	log.Printf("[DEBUG] Waiting for the component instance to become deleted, the instance ID is %s.", d.Id())
+	stateConf := &resource.StateChangeConf{
+		Pending:      []string{"RUNNING"},
+		Target:       []string{"SUCCEEDED"},
+		Refresh:      componentInstanceRefreshFunc(client, resp.JobId),
+		Timeout:      d.Timeout(schema.TimeoutDelete),
+		Delay:        5 * time.Second,
+		PollInterval: 5 * time.Second,
+	}
+	_, err = stateConf.WaitForStateContext(ctx)
+	if err != nil {
+		return diag.Errorf("error waiting for the delete of component instance (%s) to complete: %s",
+			d.Id(), err)
+	}
+
+	return nil
+}
+
 
 func buildCompCreateOpts(d *schema.ResourceData) (components.CreateOpts, error) {
 
